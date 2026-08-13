@@ -1,1 +1,4 @@
 .idea
+
+# codegraph local index cache
+.codegraph/
