@@ -41,11 +41,84 @@ const {
   Components
 } = new BdApi(config.info.name)
 
+const cpDebug = (msg) => {
+  try {
+    const line = new Date().toISOString() + ' ' + msg
+    try { window.__cpLog = (window.__cpLog || '') + line + '\n' } catch (e) { }
+    try { require('fs').appendFileSync('C:/Users/mrvel/AppData/Roaming/betterdiscord/plugins/cp-debug.log', line + '\n') } catch (e) { }
+  } catch (e) { }
+}
+
+const safeAfter = ([module, key], callback) => {
+  if (!module || typeof key !== 'string' || typeof module[key] !== 'function') {
+    cpDebug('patch skipped: ' + (module ? ('key=' + key) : 'module missing'))
+    return
+  }
+  try {
+    Patcher.after(module, key, callback)
+  } catch (e) {
+    cpDebug('patch FAILED key=' + key + ': ' + String(e && e.message || e).slice(0, 300))
+  }
+}
+
+const safeBefore = ([module, key], callback) => {
+  if (!module || typeof key !== 'string' || typeof module[key] !== 'function') {
+    cpDebug('before skipped: ' + (module ? ('key=' + key) : 'module missing'))
+    return
+  }
+  Patcher.before(module, key, callback)
+}
+
+const resolvePair = (filter, rawModule, strings) => {
+  const matchStr = (v) => {
+    const s = String(v)
+    let n = 0
+    for (const str of strings || []) if (s.includes(str)) n++
+    return n
+  }
+  const tryRaw = (raw) => {
+    if (!raw || !raw.exports) return null
+    let best = null
+    let bestScore = 0
+    for (const key of Object.keys(raw.exports)) {
+      const v = raw.exports[key]
+      if (typeof v !== 'function') continue
+      const o = v.__originalFunction || v
+      if (filter(v) || filter(v.type) || filter(o) || filter(o.type)) return [raw.exports, key]
+      const sc = Math.max(matchStr(v), matchStr(v && v.type), matchStr(o), matchStr(o && o.type))
+      if (sc > bestScore) { bestScore = sc; best = [raw.exports, key] }
+    }
+    if (!best) {
+      let sizeBest = null
+      let sizeScore = 0
+      for (const key of Object.keys(raw.exports)) {
+        const v = raw.exports[key]
+        const len = String(v.__originalFunction || v).length
+        if (len > sizeScore) { sizeScore = len; sizeBest = [raw.exports, key] }
+      }
+      if (sizeBest) { cpDebug('size-based pick: key=' + sizeBest[1] + ' len=' + sizeScore); return sizeBest }
+    } else {
+      cpDebug('best-effort pair: key=' + best[1] + ' score=' + bestScore)
+    }
+    return best
+  }
+  if (rawModule) {
+    const p = tryRaw(rawModule)
+    if (p) return p
+    cpDebug('raw exports no component match')
+  }
+  const g = tryRaw(Webpack.getModule(filter, { raw: true }))
+  if (g) return g
+  cpDebug('pair unresolved')
+  return [undefined, undefined]
+}
+
 const { Filters } = Webpack
 const { ErrorBoundary } = Components
 
 const MessageActions = Webpack.getByKeys('jumpToMessage', '_sendMessage')
 const MessageStore = Webpack.getStore('MessageStore')
+const GuildChannelStore = Webpack.getStore('ChannelStore')
 const Flux = Webpack.getByKeys('Store', 'connectStores')
 const Dispatcher = Webpack.getModule(Filters.byKeys('dispatch', 'subscribe'), { searchExports: true })
 const ChannelTypes = Webpack.getModule(Filters.byKeys('GUILD_TEXT'), { searchExports: true })
@@ -94,11 +167,11 @@ const { Checkbox, CheckboxTypes } = Webpack.getMangled(Filters.bySource('Checkbo
 })
 
 const ChannelItemModule = Webpack.getModule(Filters.bySource('shouldIndicateNewChannel', 'MANAGE_CHANNELS'), { raw: true })
-const ChannelItem = [...Webpack.getWithKey(Filters.byStrings('shouldIndicateNewChannel', 'MANAGE_CHANNELS'), { target: ChannelItemModule?.declarations })]
-const VoiceChannelItem = [...Webpack.getWithKey(Filters.byStrings('PLAYING', 'MANAGE_CHANNELS'), { target: ChannelItemModule?.declarations })]
-const StageVoiceChannelItem = [...Webpack.getWithKey(Filters.byStrings('getStageInstanceByChannel', 'MANAGE_CHANNELS'), { target: ChannelItemModule?.declarations })]
-const DMChannelItem = [...Webpack.getWithKey(Filters.byStrings('getRecipientId', 'getTypingUsers'))]
-const ChannelLink = [...Webpack.getWithKey(Filters.byStrings('hasActiveThreads', 'isGuildVocal'))]
+const ChannelItem = resolvePair(Filters.byStrings('shouldIndicateNewChannel', 'MANAGE_CHANNELS'), ChannelItemModule, ['shouldIndicateNewChannel', 'MANAGE_CHANNELS'])
+const VoiceChannelItem = resolvePair(Filters.byStrings('PLAYING', 'MANAGE_CHANNELS'), ChannelItemModule, ['PLAYING', 'MANAGE_CHANNELS'])
+const StageVoiceChannelItem = resolvePair(Filters.byStrings('getStageInstanceByChannel', 'MANAGE_CHANNELS'), ChannelItemModule, ['getStageInstanceByChannel', 'MANAGE_CHANNELS'])
+const DMChannelItem = resolvePair(Filters.byStrings('getRecipientId', 'getTypingUsers'), null, ['getRecipientId', 'getTypingUsers'])
+const ChannelLink = resolvePair(Filters.byStrings('hasActiveThreads', 'isGuildVocal'), null, ['hasActiveThreads', 'isGuildVocal'])
 const ThreadChannelItem = Webpack.getModule(Filters.bySource('thread', 'getVoiceStatesForChannel'), {
   declarationFilter: m => Filters.byStrings('thread', 'getVoiceStatesForChannel')(m?.type)
 })
@@ -114,13 +187,11 @@ const EmptyMessage = Webpack.getModule(Filters.bySource('canManageRoles', 'IS_JO
 })
 const FluxTypingUsers = Webpack.getByStrings('typingUsers', 'isThreadCreation')
 const useStateFromStores = Webpack.getModule(Filters.byStrings('useStateFromStores'), { searchExports: true })
-const AppView = [...Webpack.getWithKey(Filters.byStrings('CHANNEL_THREAD_VIEW', 'GUILD_DISCOVERY'), {
-  target: Webpack.getModule(Filters.bySource('CHANNEL_THREAD_VIEW', 'GUILD_DISCOVERY', 'data-fullscreen'), { raw: true })?.declarations
-})]
+const AppView = resolvePair(Filters.byStrings('CHANNEL_THREAD_VIEW', 'GUILD_DISCOVERY'), Webpack.getModule(Filters.bySource('CHANNEL_THREAD_VIEW', 'GUILD_DISCOVERY', 'data-fullscreen'), { raw: true }), ['CHANNEL_THREAD_VIEW', 'GUILD_DISCOVERY'])
 const ChannelChat = Webpack.getModule(m => Filters.byStrings('channelStream', 'oldestUnreadMessageId')(m?.type))
 const ChannelStreamItemTypes = Webpack.getModule(Filters.byKeys('MESSAGE', 'DIVIDER'), { searchExports: true })
 const MessageDivider = Webpack.getModule(m => Filters.byStrings('"separator"', 'isBeforeGroup')(m?.type?.render))
-const Attachment = [...Webpack.getWithKey(Filters.byStrings('getObscureReason', 'obscurityControlClassName'))]
+const Attachment = resolvePair(Filters.byStrings('getObscureReason', 'obscurityControlClassName'), null, ['getObscureReason', 'obscurityControlClassName'])
 const Embed = Webpack.getByPrototypeKeys('renderAuthor', 'renderMedia')
 const FocusRing = Webpack.getModule(Filters.bySource('focusProps', '"li"'), { declarationFilter: m => Filters.byStrings('focusProps', '"li"')(m?.render) })
 
@@ -332,6 +403,108 @@ function PreviewDialog ({ channel, messages }) {
   )
 }
 
+function HoverPreviewDialog ({ channel }) {
+  const messages = useStateFromStores([MessageStore], () => MessageStore.getMessages(channel.id))
+  const isFetchable = messages.length < settings.appearance.messagesCount && (messages.hasMoreBefore || messages.hasMoreAfter)
+  const scrollerRef = React.useRef(null)
+  const pinnedRef = React.useRef(true)
+
+  React.useEffect(() => {
+    if (isFetchable)
+      MessageActions.fetchMessages({ channelId: channel.id, limit: settings.appearance.messagesCount })
+  }, [isFetchable])
+
+  React.useEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    const onScroll = () => {
+      if (el.scrollHeight - el.scrollTop - el.clientHeight > 60) pinnedRef.current = false
+    }
+    el.addEventListener('scroll', onScroll)
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
+  React.useEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    const pin = () => { if (pinnedRef.current) el.scrollTop = el.scrollHeight }
+    pin()
+    const t = setTimeout(pin, 500)
+    return () => clearTimeout(t)
+  }, [messages])
+
+  const messageCountLimit = settings.appearance.messagesCount
+  const messageGroupSpacing = settings.appearance.groupSpacingSync
+    ? (AppearanceSettingsStore.messageGroupSpacing ?? 16)
+    : settings.appearance.groupSpacing
+
+  const channelStream = [
+    !messages.hasMoreBefore && messages.length <= messageCountLimit
+      ? { type: 'EMPTY_MESSAGE' }
+      : { type: ChannelStreamItemTypes.DIVIDER, content: `Displaying last ${messageCountLimit} messages`, cut: true }
+  ].concat(
+    useGenerateChannelStream({
+      channel,
+      messageCountLimit
+    })
+  )
+
+  const channelStreamMarkup = channelStream
+    .map((item, index) => {
+      switch (item.type) {
+        case 'EMPTY_MESSAGE':
+          return React.createElement(EmptyMessage, { channel })
+        case ChannelStreamItemTypes.DIVIDER:
+          return React.createElement(MessageDivider, {
+            className: item.cut ? 'CP__divider-cut' : '',
+            isUnread: !!item.unreadId,
+            isBeforeGroup: !item.content && isGroupStarter(channelStream[index + 1]),
+            children: item.content
+          })
+        case ChannelStreamItemTypes.MESSAGE:
+        case ChannelStreamItemTypes.THREAD_STARTER_MESSAGE:
+          return React.createElement(
+            item.type === ChannelStreamItemTypes.THREAD_STARTER_MESSAGE ? ThreadStarterMessage : MessageComponent,
+            {
+              channel,
+              message: item.content,
+              groupId: item.groupId,
+              id: `chat-messages-${item.content.id}`,
+              compact: settings.appearance.displayMode === 'compact'
+            }
+          )
+        default:
+          return null
+      }
+    })
+
+  return React.createElement(
+    'div',
+    {
+      className: `CP__popout group-spacing-${messageGroupSpacing} ${Selectors.Popout.messagesPopoutWrap}`,
+      style: {
+        height: (settings.appearance.popoutHeight ?? 30) + 'vh',
+        pointerEvents: 'auto'
+      }
+    },
+    React.createElement(PreviewContext.Provider, {
+      value: { channel },
+      children: React.createElement(
+        'div',
+        {
+          ref: scrollerRef,
+          className: 'CP__scroller',
+          style: { overflowY: 'scroll', height: '100%', display: 'block', pointerEvents: 'auto' }
+        },
+        React.createElement('div', {
+          className: 'CP__container',
+          children: channelStreamMarkup
+        })
+      )
+    })
+  )
+}
+
 function ChannelPopout ({ channel, selected, messages, children, shouldShow: _shouldShow = false, ...props }) {
   const isShiftKeyPressed = useIsShiftKeyPressed()
 
@@ -375,20 +548,22 @@ function ChannelPopoutBackdrop () {
 
 module.exports = class ChannelsPreview {
   start () {
-    this.injectCSS()
+    try {
+      cpDebug('start() called')
+      this.injectCSS()
 
-    this.patchChannelItem()
-    this.patchChannelLink()
-    this.patchThreadChannelItem()
-    this.patchDMChannelItem()
-    this.patchAppView()
-    this.patchMedia()
-    this.attachKeyboardEvents()
+      this.attachHoverPreview()
+      this.attachKeyboardEvents()
 
-    forceAppUpdate()
+      forceAppUpdate()
+      cpDebug('start() complete')
+    } catch (e) {
+      cpDebug('start() ERROR: ' + String(e && e.stack || e).slice(0, 500))
+    }
   }
 
   showPopout (channel) {
+    cpDebug('showPopout id=' + channel.id + ' type=' + channel.type + ' supported=' + SUPPORTED_CHANNEL_TYPES.includes(channel.type))
     if (!SUPPORTED_CHANNEL_TYPES.includes(channel.type)) return
 
     Dispatcher.dispatch({ type: 'CP__PREVIEW_SHOULD_SHOW', channelId: channel.id })
@@ -398,51 +573,145 @@ module.exports = class ChannelsPreview {
     Dispatcher.dispatch({ type: 'CP__PREVIEW_SHOULD_HIDE', channelId })
   }
 
-  makeChannelItemCallback () {
-    let isPatched = false
-    return (self, [{ channel }], value) => {
-      value.props.CP__state = useUpdater()
-      value.props.messages = useStateFromStores([MessageStore], () => MessageStore.getMessages(channel.id))
-      value.props.CP__shouldShowPopout = useStateFromStores([ShownPreviewsStore], () => ShownPreviewsStore.shouldShow(channel.id))
-
-      if (isPatched || !value?.type?.DecoratedComponent?.prototype?.render) return
-      isPatched = true
-
-      Patcher.after(value.type.DecoratedComponent.prototype, 'render', (self, args, value) => {
-        const { channel, messages, selected, CP__shouldShowPopout: shouldShow } = self.props
-
-        if (!SUPPORTED_CHANNEL_TYPES.includes(channel.type)) return
-
-        const popout = findInReactTree(value, m => m?.props?.renderPopout)
-        if (!popout) return
-
-        if (!self.channelItemRef && !self.__channelItemRef) {
-          self.__channelItemRef = React.createRef(null)
-        }
-        if (self.__channelItemRef && typeof popout.props.children === 'function') {
-          const ref = self.__channelItemRef
-          Patcher.after(popout.props, 'children', (self, args, value) => {
-            Patcher.after(value.props, 'children', (self, args, value) => {
-              value.props.ref = ref
-            })
-          })
-        }
-
-        const targetElementRef = self.channelItemRef ?? self.__channelItemRef
-        if (!targetElementRef) return
-
-        popout.type = ChannelPopout
-        popout.props = {
-          targetElementRef,
-          channel,
-          selected,
-          messages,
-          children: popout.props.children,
-          shouldShow,
-          onRequestClose: () => this.closePopout(channel.id)
-        }
-      })
+  attachHoverPreview () {
+    this.hoverPreview = {
+      hoverTimer: null,
+      closeTimer: null,
+      channelId: null,
+      currentLink: null,
+      root: null,
+      rootEl: null
     }
+
+    this.onChannelMouseOver = (e) => {
+      const target = e.target
+      if (!target || typeof target.closest !== 'function') return
+      const linkEl = target.closest('a[href^="/channels/"], [data-list-item-id^="channels___"]')
+      const inPortal = this.hoverPreview.rootEl && this.hoverPreview.rootEl.contains(target)
+      if (linkEl || inPortal) {
+        clearTimeout(this.hoverPreview.closeTimer)
+      }
+      if (!linkEl) return
+      if (this.hoverPreview.currentLink === linkEl) return
+      this.hoverPreview.currentLink = linkEl
+      let id = null
+      if (linkEl.tagName === 'A') {
+        const m = linkEl.getAttribute('href').match(/\/channels\/(\d+)\/(\d+)$/)
+        if (m) id = m[2]
+      } else {
+        const attr = linkEl.getAttribute('data-list-item-id')
+        if (attr && attr.indexOf('___') > -1) id = attr.slice(attr.indexOf('___') + 3)
+      }
+      if (!id) return
+      const channel = GuildChannelStore && GuildChannelStore.getChannel(id)
+      if (!channel || !SUPPORTED_CHANNEL_TYPES.includes(channel.type)) return
+      clearTimeout(this.hoverPreview.hoverTimer)
+      this.hoverPreview.hoverTimer = setTimeout(
+        () => this.openPreview(channel, linkEl),
+        settings.trigger.hoverDelay * 1000
+      )
+    }
+
+    this.onChannelMouseOut = (e) => {
+      const target = e.target
+      const to = e.relatedTarget
+      const inPopout = (n) => n && this.hoverPreview.rootEl && this.hoverPreview.rootEl.contains(n)
+      const inLink = (n) => n && this.hoverPreview.currentLink && this.hoverPreview.currentLink.contains(n)
+      if (!target || typeof target.closest !== 'function') return
+      const linkEl = target.closest('a[href^="/channels/"], [data-list-item-id^="channels___"]')
+      if (linkEl) {
+        if (this.hoverPreview.currentLink !== linkEl) return
+        if (to && (inPopout(to) || inLink(to))) return
+        this.hoverPreview.currentLink = null
+        clearTimeout(this.hoverPreview.hoverTimer)
+        this.hoverPreview.hoverTimer = null
+        clearTimeout(this.hoverPreview.closeTimer)
+        this.hoverPreview.closeTimer = setTimeout(() => this.closePreview(), 250)
+        return
+      }
+      if (this.hoverPreview.rootEl && this.hoverPreview.rootEl.contains(target)) {
+        if (to && (inPopout(to) || inLink(to))) return
+        this.hoverPreview.currentLink = null
+        clearTimeout(this.hoverPreview.hoverTimer)
+        this.hoverPreview.hoverTimer = null
+        clearTimeout(this.hoverPreview.closeTimer)
+        this.hoverPreview.closeTimer = setTimeout(() => this.closePreview(), 250)
+      }
+    }
+
+    document.addEventListener('mouseover', this.onChannelMouseOver, true)
+    document.addEventListener('mouseout', this.onChannelMouseOut, true)
+    cpDebug('hover listener attached')
+  }
+
+  openPreview (channel, anchor) {
+    try {
+      this.closePreview()
+
+      const rootEl = document.createElement('div')
+      rootEl.className = 'CP__portal'
+      document.body.appendChild(rootEl)
+      const rect = anchor.getBoundingClientRect()
+      rootEl.style.cssText = `position: fixed; left: ${Math.round(rect.right)}px; top: ${Math.max(8, rect.top - rect.height / 2)}px; z-index: 10000;`
+
+      const root = BdApi.ReactDOM.createRoot(rootEl, {
+        onUncaughtError: (e) => { cpDebug('render error: ' + String(e && e.stack || e).slice(0, 500)) },
+        onRecoverableError: (e) => { cpDebug('recoverable error: ' + String(e && e.message || e).slice(0, 300)) }
+      })
+      root.render(React.createElement(HoverPreviewDialog, { channel }))
+      this.hoverPreview.root = root
+      this.hoverPreview.rootEl = rootEl
+    } catch (e) {
+      cpDebug('openPreview ERROR: ' + String(e && e.message || e).slice(0, 300))
+      this.closePreview()
+    }
+  }
+
+  closePreview () {
+    clearTimeout(this.hoverPreview.closeTimer)
+    this.hoverPreview.closeTimer = null
+    if (this.hoverPreview && this.hoverPreview.root) {
+      try { this.hoverPreview.root.unmount() } catch (e) { }
+      this.hoverPreview.root = null
+    }
+    if (this.hoverPreview && this.hoverPreview.rootEl) {
+      try { this.hoverPreview.rootEl.remove() } catch (e) { }
+      this.hoverPreview.rootEl = null
+    }
+  }
+
+  patchChannelItem () {
+    safeAfter(ChannelItem, (self, [{ channel, selected }], value) => {
+      useUpdater()
+      const messages = useStateFromStores([MessageStore], () => MessageStore.getMessages(channel.id))
+      const shouldShow = useStateFromStores([ShownPreviewsStore], () => ShownPreviewsStore.shouldShow(channel.id))
+
+      const href = `/channels/${channel.guild_id}/${channel.id}`
+      const linkWrapper = findInReactTree(value, m => m?.children?.props?.href === href)
+      if (!linkWrapper) {
+        cpDebug('channel link NOT FOUND id=' + channel.id)
+        return
+      }
+      cpDebug('channel link FOUND id=' + channel.id)
+
+      this.patchLink({
+        link: linkWrapper.children,
+        channel,
+        selected
+      })
+
+      const { children } = linkWrapper
+      linkWrapper.children = React.createElement(ChannelPopout, {
+        targetElementRef: linkWrapper.children?.props?.ref,
+        channel,
+        selected,
+        messages,
+        children: () => children,
+        shouldShow,
+        onRequestClose: () => this.closePopout(channel.id)
+      })
+      linkWrapper.children.children = children // Allow other plugins to modify the children
+    })
   }
 
   patchLink ({ link, channel, timeoutRef = React.useRef(null), selected }) {
@@ -499,14 +768,8 @@ module.exports = class ChannelsPreview {
     }, [])
   }
 
-  patchChannelItem () {
-    Patcher.after(...ChannelItem, this.makeChannelItemCallback())
-    Patcher.after(...VoiceChannelItem, this.makeChannelItemCallback())
-    Patcher.after(...StageVoiceChannelItem, this.makeChannelItemCallback())
-  }
-
   patchChannelLink () {
-    Patcher.after(...ChannelLink, (self, [{ channel, selected }], value) => {
+    safeAfter(ChannelLink, (self, [{ channel, selected }], value) => {
       const link = findInReactTree(value, m => m?.props?.role && m?.props?.target)
       if (!link) return
 
@@ -515,13 +778,26 @@ module.exports = class ChannelsPreview {
   }
 
   patchThreadChannelItem () {
+    if (!ThreadChannelItem || typeof ThreadChannelItem.type !== 'function') {
+      cpDebug('ThreadChannelItem module NOT FOUND')
+      console.warn('[ChannelsPreview] ThreadChannelItem module not found, thread previews disabled')
+      return
+    }
+    cpDebug('ThreadChannelItem module OK')
+
     Patcher.after(ThreadChannelItem, 'type', (self, [{ thread, isSelectedChannel }], value) => {
       useUpdater()
       const messages = useStateFromStores([MessageStore], () => MessageStore.getMessages(thread.id))
       const shouldShow = useStateFromStores([ShownPreviewsStore], () => ShownPreviewsStore.shouldShow(thread.id))
 
-      const linkWrapper = findInReactTree(value, m => m?.children?.props?.className?.includes('iconVisibility'))
-      if (!linkWrapper) return
+      const href = `/channels/${thread.guild_id}/${thread.id}`
+      const linkWrapper = findInReactTree(value, m => m?.children?.props?.href === href)
+      if (!linkWrapper) {
+        cpDebug('thread link NOT FOUND id=' + thread.id)
+        console.warn('[ChannelsPreview] thread link not found for', thread.id)
+        return
+      }
+      cpDebug('thread link FOUND id=' + thread.id)
 
       this.patchLink({
         link: linkWrapper.children,
@@ -544,7 +820,7 @@ module.exports = class ChannelsPreview {
   }
 
   patchDMChannelItem () {
-    Patcher.after(...DMChannelItem, (self, [{ channel, selected }], value) => {
+    safeAfter(DMChannelItem, (self, [{ channel, selected }], value) => {
       useUpdater()
       const messages = useStateFromStores([MessageStore], () => MessageStore.getMessages(channel.id))
       const shouldShow = useStateFromStores([ShownPreviewsStore], () => ShownPreviewsStore.shouldShow(channel.id))
@@ -568,7 +844,7 @@ module.exports = class ChannelsPreview {
 
       return popout
     })
-    Patcher.after(FocusRing, 'render', (self, [{ className }], value) => {
+    safeAfter([FocusRing, 'render'], (self, [{ className }], value) => {
       if (!className?.includes(Selectors.Channel.channel)) return
 
       const { channel, selected } = React.useContext(DMChannelContext)
@@ -583,7 +859,7 @@ module.exports = class ChannelsPreview {
   }
 
   patchAppView () {
-    Patcher.after(...AppView, (self, args, value) => {
+    safeAfter(AppView, (self, args, value) => {
       useUpdater()
       if (!settings.appearance.darkenChat) return
 
@@ -600,7 +876,7 @@ module.exports = class ChannelsPreview {
   patchMedia () {
     const OBSCURE_REASON = 'explicit_content'
 
-    Patcher.before(...Attachment, (self, [props]) => {
+    safeBefore(Attachment, (self, [props]) => {
       const { channel } = React.useContext(PreviewContext)
       if (settings.behaviour.nsfw === 'obscure' && channel?.nsfw)
         props.getObscureReason = () => OBSCURE_REASON
@@ -631,7 +907,6 @@ module.exports = class ChannelsPreview {
     //language=CSS
     DOM.addStyle(`${config.info.name}-style`, `
         .CP__popout {
-            pointer-events: none;
             background-color: var(--bg-overlay-chat, var(--background-base-lower)) !important;
             border-radius: 10px;
             height: 30vh;
@@ -639,11 +914,7 @@ module.exports = class ChannelsPreview {
             width: 50vw;
             min-width: 350px;
             overflow: hidden;
-            margin-top: calc(var(--custom-app-top-bar-height) + 8px);
-        }
-
-        .CP__popout * {
-            pointer-events: none !important;
+            margin-top: 0;
         }
 
         .CP__container {
@@ -725,6 +996,9 @@ module.exports = class ChannelsPreview {
     this.clearCSS()
     Patcher.unpatchAll()
     this.clearKeyboardEvents()
+    if (this.onChannelMouseOver) document.removeEventListener('mouseover', this.onChannelMouseOver, true)
+    if (this.onChannelMouseOut) document.removeEventListener('mouseout', this.onChannelMouseOut, true)
+    this.closePreview()
     delete Embed.contextType
 
     forceAppUpdate()
